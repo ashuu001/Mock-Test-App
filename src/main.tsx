@@ -1,20 +1,29 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { createRoot } from 'react-dom/client';
-import { Clock3, Download, FileUp, RotateCcw, Save, Check, X, Minus, AlertTriangle, Trophy, ClipboardCheck } from 'lucide-react';
+import { Clock3, Download, FileUp, RotateCcw, Save, Check, X, Minus, AlertTriangle, Trophy, ClipboardCheck, LoaderCircle } from 'lucide-react';
+import * as pdfjsLib from 'pdfjs-dist';
+import { createWorker } from 'tesseract.js';
+import pdfWorker from 'pdfjs-dist/build/pdf.worker.min.mjs?url';
+
+pdfjsLib.GlobalWorkerOptions.workerSrc = pdfWorker;
 import './styles.css';
 
 type Answer = 'A' | 'B' | 'C' | 'D' | null;
+type Series = 'A' | 'B' | 'C' | 'D';
 type Evaluation = 'correct' | 'wrong' | 'unattempted' | null;
 type Phase = 'setup' | 'test' | 'marking' | 'result';
 
 type State = {
   examName: string;
+  series: Series;
   totalQuestions: number;
   durationMinutes: number;
   startedAt: number | null;
   elapsedBeforePause: number;
   answers: Answer[];
   evaluations: Evaluation[];
+  answerKey: Answer[];
+  answerKeySource: string;
   phase: Phase;
 };
 
@@ -25,12 +34,15 @@ const STORAGE_KEY = 'omr-mock-test-v2';
 
 const blankState = (): State => ({
   examName: '',
+  series: 'A',
   totalQuestions: DEFAULT_TOTAL,
   durationMinutes: DEFAULT_DURATION_MINUTES,
   startedAt: null,
   elapsedBeforePause: 0,
   answers: Array(DEFAULT_TOTAL).fill(null),
   evaluations: Array(DEFAULT_TOTAL).fill(null),
+  answerKey: Array(DEFAULT_TOTAL).fill(null),
+  answerKeySource: '',
   phase: 'setup'
 });
 
@@ -39,13 +51,17 @@ function normalizeState(value: any): State {
   const durationMinutes = Math.min(600, Math.max(1, Number(value?.durationMinutes) || DEFAULT_DURATION_MINUTES));
   const answers = Array.isArray(value?.answers) ? value.answers.slice(0, totalQuestions) : [];
   const evaluations = Array.isArray(value?.evaluations) ? value.evaluations.slice(0, totalQuestions) : [];
+  const answerKey = Array.isArray(value?.answerKey) ? value.answerKey.slice(0, totalQuestions) : [];
   return {
     ...blankState(),
     ...value,
+    series: ['A','B','C','D'].includes(value?.series) ? value.series : 'A',
     totalQuestions,
     durationMinutes,
     answers: [...answers, ...Array(totalQuestions - answers.length).fill(null)],
-    evaluations: [...evaluations, ...Array(totalQuestions - evaluations.length).fill(null)]
+    evaluations: [...evaluations, ...Array(totalQuestions - evaluations.length).fill(null)],
+    answerKey: [...answerKey, ...Array(totalQuestions - answerKey.length).fill(null)],
+    answerKeySource: typeof value?.answerKeySource === 'string' ? value.answerKeySource : ''
   };
 }
 
@@ -83,7 +99,11 @@ function App() {
   const [state, setState] = useState<State>(() => loadLocal() ?? blankState());
   const [now, setNow] = useState(Date.now());
   const fileRef = useRef<HTMLInputElement>(null);
+  const answerKeyRef = useRef<HTMLInputElement>(null);
   const [showReset, setShowReset] = useState(false);
+  const [keyLoading, setKeyLoading] = useState(false);
+  const [keyStatus, setKeyStatus] = useState('');
+  const [detectedSeries, setDetectedSeries] = useState<Series | null>(null);
 
   useEffect(() => { localStorage.setItem(STORAGE_KEY, JSON.stringify(state)); }, [state]);
   useEffect(() => {
@@ -111,14 +131,20 @@ function App() {
   const updateEval = (i: number, ev: Evaluation) => {
     setState(s => { const e = [...s.evaluations]; e[i] = e[i] === ev ? null : ev; return { ...s, evaluations: e }; });
   };
-  const start = () => setState(s => ({
+  const start = () => {
+    setDetectedSeries(null);
+    setKeyStatus('');
+    setState(s => ({
     ...s,
     phase: 'test',
     startedAt: Date.now(),
     elapsedBeforePause: 0,
     answers: Array(s.totalQuestions).fill(null),
-    evaluations: Array(s.totalQuestions).fill(null)
+    evaluations: Array(s.totalQuestions).fill(null),
+    answerKey: Array(s.totalQuestions).fill(null),
+    answerKeySource: ''
   }));
+  };
   const finishTest = () => setState(s => ({ ...s, phase: 'marking', startedAt: null, elapsedBeforePause: Math.min(s.durationMinutes * 60, elapsed) }));
   const finishMarking = () => setState(s => ({ ...s, phase: 'result' }));
   const reset = () => { localStorage.removeItem(STORAGE_KEY); setState(blankState()); setShowReset(false); };
@@ -128,7 +154,7 @@ function App() {
     download(`${(state.examName || 'mock-test').replace(/[^a-z0-9-_]+/gi, '-').toLowerCase()}-answers.json`, JSON.stringify(payload, null, 2));
   };
   const exportResult = () => {
-    const payload = { examName: state.examName, totalQuestions: state.totalQuestions, durationMinutes: state.durationMinutes, maxMarks: MAX_MARKS, correct: stats.correct, wrong: stats.wrong, unattempted: stats.unattempted, positiveMarks: Number(stats.positive.toFixed(6)), negativeMarks: Number(stats.negative.toFixed(6)), score: Number(stats.score.toFixed(6)), answers: state.answers, evaluations: state.evaluations };
+    const payload = { examName: state.examName, totalQuestions: state.totalQuestions, durationMinutes: state.durationMinutes, maxMarks: MAX_MARKS, correct: stats.correct, wrong: stats.wrong, unattempted: stats.unattempted, positiveMarks: Number(stats.positive.toFixed(6)), negativeMarks: Number(stats.negative.toFixed(6)), score: Number(stats.score.toFixed(6)), answers: state.answers, evaluations: state.evaluations, answerKey: state.answerKey, answerKeySource: state.answerKeySource };
     download(`${(state.examName || 'mock-test').replace(/[^a-z0-9-_]+/gi, '-').toLowerCase()}-result.json`, JSON.stringify(payload, null, 2));
   };
   const loadFile = (file: File) => {
@@ -139,6 +165,117 @@ function App() {
         setState(normalizeState({ ...imported, phase: imported.phase ?? 'setup' }));
       } catch { alert('That file is not a valid OMR Mock Test save file.'); }
     }; reader.readAsText(file);
+  };
+
+
+  const applyAnswerKey = (key: Answer[], source: string) => {
+    const normalized = Array.from({ length: state.totalQuestions }, (_, i) => key[i] ?? null);
+    const evaluations: Evaluation[] = normalized.map((correctAnswer, i) => {
+      if (!correctAnswer) return null;
+      const userAnswer = state.answers[i];
+      if (!userAnswer) return 'unattempted';
+      return userAnswer === correctAnswer ? 'correct' : 'wrong';
+    });
+    const parsed = normalized.filter(Boolean).length;
+    setState(s => ({ ...s, answerKey: normalized, answerKeySource: source, evaluations }));
+    return parsed;
+  };
+
+  const isolateSeriesSection = (text: string, series: Series) => {
+    const normalized = text.replace(/\r/g, '\n').replace(/\u00a0/g, ' ');
+    const header = new RegExp(`SERIES\\s*[-–—:]?\\s*${series}\\b`, 'i');
+    const nextHeader = /SERIES\\s*[-–—:]?\\s*[ABCD]\\b/gi;
+    const match = header.exec(normalized);
+    if (!match) return normalized;
+    nextHeader.lastIndex = match.index + match[0].length;
+    const next = nextHeader.exec(normalized);
+    return normalized.slice(match.index + match[0].length, next ? next.index : normalized.length);
+  };
+
+  const extractAnswerPairs = (text: string, series: Series): Answer[] => {
+    const result: Answer[] = Array(state.totalQuestions).fill(null);
+    const cleaned = isolateSeriesSection(text, series)
+      .replace(/[|]/g, 'I')
+      .replace(/[“”‘’]/g, '')
+      .replace(/\r/g, '\n');
+    const patterns = [
+      /(?:^|[\n;])\s*(?:Q(?:uestion)?\s*)?(\d{1,3})\s*[\)\].:\-–—]\s*([ABCD])(?=\s|$|[,;])/gi,
+      /(?:^|[\n])\s*(?:Q(?:uestion)?\s*)?(\d{1,3})\s+([ABCD])(?:\s|$)/gi,
+      /(?:Q(?:uestion)?\s*)?(\d{1,3})\s*[-:]\s*([ABCD])\b/gi
+    ];
+    for (const re of patterns) {
+      let m: RegExpExecArray | null;
+      while ((m = re.exec(cleaned)) !== null) {
+        const q = Number(m[1]), a = m[2].toUpperCase() as Answer;
+        if (q >= 1 && q <= state.totalQuestions && !result[q - 1]) result[q - 1] = a;
+      }
+    }
+    return result;
+  };
+
+  const readAnswerKey = async (file: File): Promise<{ key: Answer[]; source: string; detectedSeries: Series | null }> => {
+    let text = '';
+    if (file.type === 'application/pdf' || file.name.toLowerCase().endsWith('.pdf')) {
+      const data = await file.arrayBuffer();
+      const pdf = await pdfjsLib.getDocument({ data }).promise;
+      for (let pageNo = 1; pageNo <= pdf.numPages; pageNo++) {
+        const page = await pdf.getPage(pageNo);
+        const content = await page.getTextContent();
+        text += content.items.map((item: any) => item.str || '').join(' ') + '\n';
+      }
+      let key = extractAnswerPairs(text, state.series);
+      let usedSeries: Series | null = /SERIES\s*[-–—:]?\s*[ABCD]\b/i.test(text) ? state.series : null;
+      if (key.filter(Boolean).length < Math.min(3, state.totalQuestions)) {
+        const worker = await createWorker('eng');
+        try {
+          let ocrText = '';
+          for (let pageNo = 1; pageNo <= pdf.numPages; pageNo++) {
+            const page = await pdf.getPage(pageNo);
+            const viewport = page.getViewport({ scale: 1.8 });
+            const canvas = document.createElement('canvas');
+            canvas.width = Math.ceil(viewport.width);
+            canvas.height = Math.ceil(viewport.height);
+            const ctx = canvas.getContext('2d')!;
+            await page.render({ canvasContext: ctx, viewport }).promise;
+            const { data } = await worker.recognize(canvas);
+            ocrText += data.text + '\n';
+          }
+          key = extractAnswerPairs(ocrText, state.series);
+          if (/SERIES\s*[-–—:]?\s*[ABCD]\b/i.test(ocrText)) usedSeries = state.series;
+        } finally {
+          await worker.terminate();
+        }
+      }
+      return { key, source: file.name, detectedSeries: usedSeries };
+    }
+    const worker = await createWorker('eng');
+    try {
+      const { data } = await worker.recognize(file);
+      const text = data.text;
+      return { key: extractAnswerPairs(text, state.series), source: file.name, detectedSeries: /SERIES\s*[-–—:]?\s*[ABCD]\b/i.test(text) ? state.series : null };
+    } finally {
+      await worker.terminate();
+    }
+  };
+
+  const uploadAnswerKey = async (file: File) => {
+    setKeyLoading(true);
+    setKeyStatus('Reading answer key…');
+    try {
+      const { key, source, detectedSeries: foundSeries } = await readAnswerKey(file);
+      setDetectedSeries(foundSeries);
+      const parsed = applyAnswerKey(key, source);
+      if (!parsed) {
+        setKeyStatus('No answers were detected. Use a key with entries like 1-A, 2-B, 3-C.');
+      } else {
+        setKeyStatus(`${parsed}/${state.totalQuestions} answers detected from ${source}. Results were calculated automatically.`);
+      }
+    } catch (error) {
+      console.error(error);
+      setKeyStatus('Could not read that file. Try a clear image/PDF with question numbers and A/B/C/D answers.');
+    } finally {
+      setKeyLoading(false);
+    }
   };
 
   const answeredCount = state.answers.filter(Boolean).length;
@@ -162,7 +299,7 @@ function App() {
       </header>
 
       {state.phase === 'test' && <TestView state={state} updateAnswer={updateAnswer} answeredCount={answeredCount} finish={finishTest} remaining={remaining} />}
-      {state.phase === 'marking' && <MarkingView state={state} updateEval={updateEval} evaluatedCount={evaluatedCount} stats={stats} finish={finishMarking} />}
+      {state.phase === 'marking' && <MarkingView state={state} setState={setState} updateEval={updateEval} evaluatedCount={evaluatedCount} stats={stats} finish={finishMarking} answerKeyRef={answerKeyRef} keyLoading={keyLoading} keyStatus={keyStatus} uploadAnswerKey={uploadAnswerKey} detectedSeries={detectedSeries} />}
       {state.phase === 'result' && <ResultView state={state} stats={stats} exportResult={exportResult} backToMarking={() => setState(s => ({...s, phase:'marking'}))} />}
 
       {showReset && <div className="modalBackdrop"><div className="modal"><AlertTriangle size={28}/><h3>Reset this test?</h3><p>This will permanently clear the current local answer sheet from this browser.</p><div className="modalActions"><button className="secondary" onClick={() => setShowReset(false)}>Cancel</button><button className="dangerBtn" onClick={reset}>Reset Test</button></div></div></div>}
@@ -184,6 +321,8 @@ function Setup({ state, setState, start, load, save, reset, fileRef, loadFile, s
           totalQuestions: safeValue,
           answers: Array(safeValue).fill(null),
           evaluations: Array(safeValue).fill(null),
+          answerKey: Array(safeValue).fill(null),
+          answerKeySource: '',
           phase: 'setup'
         };
       }
@@ -198,6 +337,11 @@ function Setup({ state, setState, start, load, save, reset, fileRef, loadFile, s
       <p className="muted">Customize the number of questions and time limit before starting. The maximum score stays at 100 and negative marking remains 1/3.</p>
       <label className="fieldLabel">Exam name</label>
       <input className="examInput" placeholder="Enter exam name" value={state.examName} onChange={e => setState((s: State) => ({...s, examName: e.target.value}))}/>
+      <label className="fieldLabel seriesLabel">Answer-key series</label>
+      <div className="seriesPicker">
+        {(['A','B','C','D'] as Series[]).map(series => <button type="button" key={series} className={state.series === series ? 'active' : ''} onClick={() => setState((s: State) => ({...s, series}))}>Series {series}</button>)}
+      </div>
+      <span className="fieldHint">Choose the same series printed on the official answer key. This is important because each series has different answers.</span>
       <div className="customConfig">
         <div className="configField">
           <label className="fieldLabel">Number of questions</label>
@@ -236,11 +380,26 @@ function TestView({ state, updateAnswer, answeredCount, finish, remaining }: any
   </main>
 }
 
-function MarkingView({ state, updateEval, evaluatedCount, stats, finish }: any) {
+function MarkingView({ state, updateEval, evaluatedCount, stats, finish, answerKeyRef, keyLoading, keyStatus, uploadAnswerKey }: any) {
   return <main className="content">
-    <div className="infoRow"><div><h2>Marking Mode</h2><p>Check your official answer key, then mark each question as correct, wrong, or unattempted.</p></div><div className="progressBox"><b>{evaluatedCount}/{state.totalQuestions}</b><span>evaluated</span></div></div>
+    <div className="infoRow"><div><h2>Automatic Marking</h2><p>Upload the official answer key as a PDF or clear picture. The app reads the key, compares it with your answers, and calculates the score automatically.</p></div><div className="progressBox"><b>{evaluatedCount}/{state.totalQuestions}</b><span>evaluated</span></div></div>
+    <div className="answerKeyPanel">
+      <div className="answerKeyIcon"><ClipboardCheck size={21}/></div>
+      <div className="answerKeyCopy">
+        <strong>Official answer key</strong>
+        <span>Supports the tabular UPSC-style PDF/image format with Series A, B, C or D.</span>
+        <small>Selected key series: <b>{state.series}</b>{state.answerKeySource ? ` · Loaded: ${state.answerKeySource}` : ''}</small>
+      </div>
+      <button className="primary keyUpload" disabled={keyLoading} onClick={() => answerKeyRef.current?.click()}>
+        {keyLoading ? <><LoaderCircle size={17} className="spin"/> Reading…</> : <><FileUp size={17}/> Upload Answer Key</>}
+      </button>
+      <input ref={answerKeyRef} type="file" accept=".pdf,image/*" hidden onChange={(e: any) => e.target.files?.[0] && uploadAnswerKey(e.target.files[0])}/>
+    </div>
+    {detectedSeries && <div className="keyStatus">Detected/used Series {detectedSeries}. The 120-question table for that series was used for scoring.</div>}
+    {keyStatus && <div className={`keyStatus ${keyStatus.startsWith('No ') || keyStatus.startsWith('Could not') ? 'error' : ''}`}>{keyStatus}</div>}
+    <div className="scoringNote"><b>Scoring:</b> Correct +{stats.markPerQuestion.toFixed(4)} · Wrong −{stats.negativePerQuestion.toFixed(4)} · Unattempted 0 · Final score out of 100</div>
     <div className="legend"><span><i className="dot correct"/> Correct</span><span><i className="dot wrong"/> Wrong</span><span><i className="dot unattempted"/> Unattempted</span></div>
-    <div className="markGrid">{state.evaluations.map((ev: Evaluation, i: number) => <div className={`markCard ${ev || ''}`} key={i}><div className="markHead"><b>Q {i+1}</b><span>Your answer: <strong>{state.answers[i] ?? '—'}</strong></span></div><div className="markButtons"><button className={ev==='correct'?'active':''} onClick={() => updateEval(i,'correct')}><Check size={16}/> Correct</button><button className={ev==='wrong'?'active':''} onClick={() => updateEval(i,'wrong')}><X size={16}/> Wrong</button><button className={ev==='unattempted'?'active':''} onClick={() => updateEval(i,'unattempted')}><Minus size={16}/> Unattempted</button></div></div>)}</div>
+    <div className="markGrid">{state.evaluations.map((ev: Evaluation, i: number) => <div className={`markCard ${ev || ''}`} key={i}><div className="markHead"><b>Q {i+1}</b><span>Your: <strong>{state.answers[i] ?? '—'}</strong> · Key: <strong>{state.answerKey?.[i] ?? '—'}</strong></span></div><div className="markButtons"><button className={ev==='correct'?'active':''} onClick={() => updateEval(i,'correct')}><Check size={16}/> Correct</button><button className={ev==='wrong'?'active':''} onClick={() => updateEval(i,'wrong')}><X size={16}/> Wrong</button><button className={ev==='unattempted'?'active':''} onClick={() => updateEval(i,'unattempted')}><Minus size={16}/> Unattempted</button></div></div>)}</div>
     <div className="bottomBar"><div><b>{stats.correct}</b> correct <span>·</span> <b>{stats.wrong}</b> wrong <span>·</span> <b>{stats.unattempted}</b> unattempted</div><button className="primary" onClick={finish}>Calculate Result <Trophy size={17}/></button></div>
   </main>
 }
