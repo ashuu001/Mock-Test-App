@@ -35,15 +35,3 @@ npm run preview
 ## Important
 The project source is complete, but dependencies are intentionally not bundled. Run `npm install` on your own machine; it will install React, Vite, TypeScript and Lucide React.
 
-
-## Automatic answer-key marking
-
-After finishing a test, the app opens **Automatic Marking**. Use **Upload Answer Key** to upload an official key as a PDF or image (JPG/PNG/WEBP). Text-based PDFs are read directly; scanned PDFs and images are processed with OCR.
-
-For best recognition, format the key with clear entries such as:
-`1-A, 2-C, 3-B, 4-D`
-or
-`Q1: A`
-`Q2: C`
-
-The app compares each detected key answer against the saved response, classifies questions as correct/wrong/unattempted, and calculates the existing 100-mark score with 1/3 negative marking. You can manually edit any classification after automatic marking.
